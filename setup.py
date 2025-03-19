@@ -137,7 +137,7 @@ if __name__ == '__main__':
     else:
         ext_modules = []
 
-    write_version_py()
+    # write_version_py()
     setup(
         name='basicsr',
         version=get_version(),
@@ -160,7 +160,7 @@ if __name__ == '__main__':
         ],
         license='Apache License 2.0',
         setup_requires=['cython', 'numpy'],
-        install_requires=get_requirements(),
+        # install_requires=get_requirements(),
         ext_modules=ext_modules,
         cmdclass={'build_ext': BuildExtension},
         zip_safe=False)

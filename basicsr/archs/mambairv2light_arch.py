@@ -24,7 +24,6 @@ def semantic_neighbor(x, index):
     for _ in range(x.dim() - index.dim()):
         index = index.unsqueeze(-1)
     index = index.expand(x.shape)
-
     shuffled_x = torch.gather(x, dim=dim - 1, index=index)
     return shuffled_x
 
@@ -183,7 +182,7 @@ class WindowAttention(nn.Module):
 
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
-
+        
         relative_position_bias = self.relative_position_bias_table[rpi.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
@@ -241,16 +240,16 @@ class ASSM(nn.Module):
         )
 
     def forward(self, x, x_size, token):
-        B, n, C = x.shape
+        B, n, C = x.shape # [B, HW, dim]
         H, W = x_size
 
         full_embedding = self.embeddingB.weight @ token.weight  # [128, C]
 
         pred_route = self.route(x)  # [B, HW, num_token]
+
         cls_policy = F.gumbel_softmax(pred_route, hard=True, dim=-1)  # [B, HW, num_token]
-
         prompt = torch.matmul(cls_policy, full_embedding).view(B, n, self.d_state)
-
+        
         detached_index = torch.argmax(cls_policy.detach(), dim=-1, keepdim=False).view(B, n)  # [B, HW]
         x_sort_values, x_sort_indices = torch.sort(detached_index, dim=-1, stable=False)
         x_sort_indices_reverse = index_reverse(x_sort_indices)
@@ -262,6 +261,7 @@ class ASSM(nn.Module):
         x = x.view(B, cc, -1).contiguous().permute(0, 2, 1)  # b,n,c
 
         semantic_x = semantic_neighbor(x, x_sort_indices)
+
         y = self.selectiveScan(semantic_x, prompt)
         y = self.out_proj(self.out_norm(y))
         x = semantic_neighbor(y, x_sort_indices_reverse)
@@ -389,8 +389,8 @@ class Selective_Scan(nn.Module):
             delta_softplus=True,
             return_last_state=False,
         ).view(B, K, -1, L)
-        assert out_y.dtype == torch.float
 
+        assert out_y.dtype == torch.float
         return out_y[:, 0]
 
     def forward(self, x: torch.Tensor, prompt, **kwargs):
@@ -463,7 +463,7 @@ class AttentiveLayer(nn.Module):
         mlp_hidden_dim = int(dim * self.mlp_ratio)
 
         self.convffn1 = GatedMLP(in_features=dim,hidden_features=mlp_hidden_dim,out_features=dim)
-        self.convffn2 =  GatedMLP(in_features=dim,hidden_features=mlp_hidden_dim,out_features=dim)
+        self.convffn2 = GatedMLP(in_features=dim,hidden_features=mlp_hidden_dim,out_features=dim)
 
         self.embeddingA = nn.Embedding(self.inner_rank, d_state)
         self.embeddingA.weight.data.uniform_(-1 / self.inner_rank, 1 / self.inner_rank)
@@ -485,24 +485,30 @@ class AttentiveLayer(nn.Module):
             shifted_qkv = qkv
             attn_mask = None
         x_windows = window_partition(shifted_qkv, self.window_size)
+
         x_windows = x_windows.view(-1, self.window_size * self.window_size, c3)
         attn_windows = self.win_mhsa(x_windows, rpi=params['rpi_sa'], mask=attn_mask)
+
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, c)
         shifted_x = window_reverse(attn_windows, self.window_size, h, w)  # b h' w' c
         if self.shift_size > 0:
             attn_x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             attn_x = shifted_x
+
+        print(attn_windows.shape, "attentive layer part1 shifted_x")
+
         x_win = attn_x.view(b, n, c) + shortcut
         x_win = self.convffn1(self.norm2(x_win), x_size) + x_win
         x = shortcut * self.scale1 + x_win
+        print("attentive layer part1")
 
         # part2: Attentive State Space
         shortcut = x
         x_aca = self.assm(self.norm3(x), x_size, self.embeddingA) + x
         x = x_aca + self.convffn2(self.norm4(x_aca), x_size)
         x = shortcut * self.scale2 + x
-
+        print("attentive layer part2")
         return x
 
 
@@ -574,8 +580,9 @@ class BasicBlock(nn.Module):
 
     def forward(self, x, x_size, params):
         b, n, c = x.shape
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             x = layer(x, x_size, params)
+            
         if self.downsample is not None:
             x = self.downsample(x)
         return x
@@ -643,7 +650,11 @@ class ASSB(nn.Module):
                 nn.Conv2d(dim // 4, dim, 3, 1, 1))
 
     def forward(self, x, x_size, params):
-        return self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x, x_size, params), x_size))) + x
+        out = self.residual_group(x, x_size, params)
+        out = self.patch_unembed(out, x_size)
+        out = self.conv(out)
+        out = self.patch_embed(out) + x
+        return out
 
 
 class PatchEmbed(nn.Module):
@@ -780,34 +791,35 @@ class UpsampleOneStep(nn.Sequential):
         return flops
 
 
-@ARCH_REGISTRY.register()
+# @ARCH_REGISTRY.register()
 class MambaIRv2Light(nn.Module):
     def __init__(self,
-                 img_size=64,
-                 patch_size=1,
-                 in_chans=3,
-                 embed_dim=48,
-                 d_state=8,
-                 depths=(6, 6, 6, 6,),
-                 num_heads=(4, 4, 4, 4,),
-                 window_size=16,
-                 inner_rank=32,
-                 num_tokens=64,
-                 convffn_kernel_size=5,
-                 mlp_ratio=2.,
-                 qkv_bias=True,
-                 norm_layer=nn.LayerNorm,
-                 ape=False,
-                 patch_norm=True,
-                 use_checkpoint=False,
-                 upscale=2,
-                 img_range=1.,
-                 upsampler='',
-                 resi_connection='1conv',
+                 img_size = 64,
+                 patch_size = 1,
+                 in_chans = 3,
+                 out_chans = 3,
+                 embed_dim = 48,
+                 d_state = 8,
+                 depths = (6, 6, 6, 6,),
+                 num_heads = (4, 4, 4, 4,),
+                 window_size = 16,
+                 inner_rank = 32,
+                 num_tokens = 64,
+                 convffn_kernel_size = 5,
+                 mlp_ratio = 2.,
+                 qkv_bias = True,
+                 norm_layer = nn.LayerNorm,
+                 ape = False,
+                 patch_norm = True,
+                 use_checkpoint = False,
+                 upscale = 2,
+                 img_range = 1.,
+                 upsampler = '',
+                 resi_connection = '1conv',
                  **kwargs):
         super().__init__()
         num_in_ch = in_chans
-        num_out_ch = in_chans
+        num_out_ch = out_chans
         num_feat = 64
         self.img_range = img_range
         if in_chans == 3:
@@ -889,9 +901,12 @@ class MambaIRv2Light(nn.Module):
         elif resi_connection == '3conv':
             # to save parameters and memory
             self.conv_after_body = nn.Sequential(
-                nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1))
+                nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1),
+                )
 
         # ------------------------- 3, high quality image reconstruction ------------------------- #
         if self.upsampler == 'pixelshuffle':
@@ -913,16 +928,16 @@ class MambaIRv2Light(nn.Module):
             self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
             self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
-            self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+            self.lrelu = nn.LeakyReLU(negative_slope = 0.2, inplace = True)
         else:
             # for image denoising and JPEG compression artifact reduction
             self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
-
         self.apply(self._init_weights)
 
+        
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std = .02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -942,8 +957,8 @@ class MambaIRv2Light(nn.Module):
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
-
-        for layer in self.layers:
+        
+        for i, layer in enumerate(self.layers):
             x = layer(x, x_size, params)
 
         x = self.norm(x)  # b seq_len c
@@ -1001,7 +1016,7 @@ class MambaIRv2Light(nn.Module):
 
         attn_mask = self.calculate_mask([h, w]).to(x.device)
         params = {'attn_mask': attn_mask, 'rpi_sa': self.relative_position_index_SA}
-
+        
         if self.upsampler == 'pixelshuffle':
             # for classical SR
             x = self.conv_first(x)
@@ -1038,20 +1053,33 @@ class MambaIRv2Light(nn.Module):
 
 if __name__ == '__main__':
     upscale = 4
+    img_size = 200
+ 
     model = MambaIRv2Light(
-        upscale=2,
-        img_size=64,
-        embed_dim=48,
-        d_state=8,
-        depths=[5, 5, 5, 5],
-        num_heads=[4, 4, 4, 4],
-        window_size=16,
-        inner_rank=32,
-        num_tokens=64,
-        convffn_kernel_size=5,
-        img_range=1.,
-        mlp_ratio=1.,
-        upsampler='pixelshuffledirect').cuda()
+              img_size = img_size,
+              patch_size = 1,
+              in_chans = 8,
+              out_chans = 3,
+              embed_dim = 48,
+              d_state=8,
+              depths=[5, 5, 5, 5],
+              num_heads=(4,4,4,4),
+              window_size=16,
+              inner_rank=32,
+              num_tokens=64,
+              convffn_kernel_size=5,
+              mlp_ratio=2.,
+              qkv_bias=True,
+              norm_layer=nn.LayerNorm,
+              ape=False,
+              patch_norm=True,
+              use_checkpoint=False,
+              upscale=2,
+              img_range=1.,
+              upsampler='pixelshuffledirect',
+              resi_connection='1conv',
+              ).cuda()
+
 
     # Model Size
     total = sum([param.nelement() for param in model.parameters()])
@@ -1060,7 +1088,12 @@ if __name__ == '__main__':
     print(trainable_num)
 
     # Test
-    _input = torch.randn([2, 3, 64, 64]).cuda()
+    _input = torch.randn([2, 8, img_size, img_size]).cuda()
     output = model(_input).cuda()
     print(output.shape)
+
+
+
+
+
 
